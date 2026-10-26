@@ -1,51 +1,191 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
-UnoRouter Free Monitor — трей-индикатор бесплатной квоты UnoRouter.
-Опрос: GET https://openrouter.ai/api/v1/key (т.к. UnoRouter использует тот же endpoint).
+UnoRouter Free Monitor — трей-индикатор расходования квоты UnoRouter.
+API: https://api.unorouter.com
+  GET /v1/dashboard/billing/subscription  -> лимиты (hard_limit_usd, soft_limit_usd)
+  GET /v1/dashboard/billing/usage?start_date&end_date -> расход (total_usage, в центах)
+Ключ передаётся как Authorization: Bearer <ключ>.
 #>
+[CmdletBinding()]
 param([switch]$Once)
 $ErrorActionPreference='Stop'
-$script:AppName='UnoRouter Free Monitor'
-$script:ApiUrl='https://openrouter.ai/api/v1/key'
-$script:LogFile=Join-Path $PSScriptRoot 'unorouter-usage.log'
-function Read-Config{
-  $c=Get-Content (Join-Path $PSScriptRoot 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-  if([string]::IsNullOrWhiteSpace($c.api_key)) { throw 'В config.json не заполнен api_key. Вставьте ключ из UnoRouter (sk-...).' }
-  return $c
+
+$AppName    = 'UnoRouter Free Monitor'
+$BaseUrl    = 'https://api.unorouter.com'
+$LogFile    = Join-Path $PSScriptRoot 'unorouter-usage.log'
+$MutexName  = 'Global\UnoRouterFreeMonitorTray'
+
+function Log-Str($msg){
+    try {
+        Add-Content -LiteralPath $LogFile -Value ("[{0}] {1}" -f (Get-Date -f 'yyyy-MM-dd HH:mm:ss'), $msg) -Encoding UTF8
+        if ((Get-Item -LiteralPath $LogFile).Length -gt 200KB) {
+            $tail = Get-Content -LiteralPath $LogFile -Tail 200
+            Set-Content -LiteralPath $LogFile -Value $tail -Encoding UTF8
+        }
+    } catch {}
 }
-function Get-Usage($cfg){
-  $h=@{'Authorization'='Bearer '+$cfg.api_key;'Accept'='application/json'}
-  $r=Invoke-WebRequest -Uri $script:ApiUrl -Headers $h -UseBasicParsing -TimeoutSec 20
-  $d=$r.Content|ConvertFrom-Json
-  $m=$d.data.free_model_daily_requests
-  $used=[int][string]$m.used; $limit=[int][string]$m.limit
-  $pct=[int][math]::Round(($used/$limit)*100,0,[System.MidpointRounding]::AwayFromZero)
-  $rem=[int][string]$m.remaining
-  return [pscustomobject]@{used=$used;limit=$limit;pct=$pct;remaining=$rem}
+
+function Read-Config {
+    $path = Join-Path $PSScriptRoot 'config.json'
+    if (-not (Test-Path -LiteralPath $path)) { throw "Не найден config.json рядом со скриптом: $path" }
+    $cfg = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace([string]$cfg.api_key)) {
+        throw 'В config.json не заполнен api_key. Вставьте ключ UnoRouter (sk-...).'
+    }
+    $interval = 300
+    if ($null -ne $cfg.update_interval) { try { $interval = [int]$cfg.update_interval } catch {} }
+    if ($interval -lt 60 -or $interval -gt 3600) { $interval = 300 }
+    return [pscustomobject]@{ api_key = ([string]$cfg.api_key).Trim(); update_interval = $interval }
 }
-if($Once){
-  try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{}
-  try{$cfg=Read-Config;$r=Get-Usage $cfg;Write-Host ("UnoRouter: {0}% использовано ({1}/{2}), осталось {3}" -f $r.pct,$r.used,$r.limit,$r.remaining);exit 0}catch{Write-Host ("ОШИБКА: "+$_);exit 1}
+
+function Invoke-Api($path, $cfg) {
+    $headers = @{ 'Authorization' = 'Bearer ' + $cfg.api_key; 'Accept' = 'application/json' }
+    $r = Invoke-WebRequest -Uri ($BaseUrl + $path) -Headers $headers -UseBasicParsing -TimeoutSec 20
+    return ($r.Content | ConvertFrom-Json)
 }
-# --- трей режим (основной) ---
+
+function Get-Usage($cfg) {
+    $sub = Invoke-Api '/v1/dashboard/billing/subscription' $cfg
+    $hard = 0.0; $soft = 0.0
+    try { $hard = [double]$sub.hard_limit_usd } catch {}
+    try { $soft = [double]$sub.soft_limit_usd } catch {}
+
+    $today = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+    $tomorrow = (Get-Date).ToUniversalTime().AddDays(1).ToString('yyyy-MM-dd')
+    $monthStart = (Get-Date).ToUniversalTime().ToString('yyyy-MM-01')
+
+    $uToday = Invoke-Api ("/v1/dashboard/billing/usage?start_date={0}&end_date={1}" -f $today, $tomorrow) $cfg
+    $uMonth = Invoke-Api ("/v1/dashboard/billing/usage?start_date={0}&end_date={1}" -f $monthStart, $tomorrow) $cfg
+
+    # total_usage в центах
+    $todayUsd = 0.0; $monthUsd = 0.0
+    try { $todayUsd = [double]$uToday.total_usage / 100.0 } catch {}
+    try { $monthUsd = [double]$uMonth.total_usage / 100.0 } catch {}
+
+    $limit = if ($soft -gt 0 -and $soft -lt $hard) { $soft } else { $hard }
+    $unlimited = ($limit -le 0 -or $limit -ge 1000000)
+
+    $pct = 0
+    if (-not $unlimited -and $limit -gt 0) {
+        $pct = [int][math]::Round(($monthUsd / $limit) * 100, 0, [System.MidpointRounding]::AwayFromZero)
+        if ($pct -lt 0) { $pct = 0 }
+    }
+
+    return [pscustomobject]@{
+        todayUsd = $todayUsd
+        monthUsd = $monthUsd
+        limit    = $limit
+        unlimited = $unlimited
+        pct      = $pct
+    }
+}
+
+if ($Once) {
+    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+    try {
+        $cfg = Read-Config
+        $u = Get-Usage $cfg
+        $lim = if ($u.unlimited) { 'без лимита' } else { ('{0:N2} USD' -f $u.limit) }
+        Write-Host ('UnoRouter: сегодня {0:N2} USD · месяц {1:N2} USD · лимит {2} · использовано {3}%' -f $u.todayUsd, $u.monthUsd, $lim, $u.pct)
+        exit 0
+    } catch {
+        Write-Host ('ОШИБКА: ' + $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
+}
+
+# ======================= трей =======================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$tray=New-Object System.Windows.Forms.NotifyIcon
-function Icon($p){
-  $b=New-Object System.Drawing.Bitmap(16,16); $g=[System.Drawing.Graphics]::FromImage($b); $g.SmoothingMode=[System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; $g.Clear([System.Drawing.Color]::Transparent)
-  $col=if($p -ge 100){[System.Drawing.Color]::FromArgb(200,30,30)}elseif($p -ge 90){[System.Drawing.Color]::FromArgb(220,50,50)}elseif($p -ge 70){[System.Drawing.Color]::FromArgb(230,150,40)}else{[System.Drawing.Color]::FromArgb(40,150,90)}
-  $g.FillEllipse((New-Object System.Drawing.SolidBrush $col),1,1,14,14)
-  $label=if($p -ge 100){'!'}else{[string]$p}
-  $f=New-Object System.Drawing.Font('Segoe UI',8,[System.Drawing.FontStyle]::Bold); $sf=New-Object System.Drawing.StringFormat; $sf.Alignment=[System.Drawing.StringAlignment]::Center; $sf.LineAlignment=[System.Drawing.StringAlignment]::Center
-  $g.DrawString($label,$f,[System.Drawing.Brushes]::White,(New-Object System.Drawing.RectangleF(0,0,16,16)),$sf); $g.Dispose()
-  $i=[System.Drawing.Icon]::FromHandle($b.GetHicon()); $b.Dispose(); return $i
+
+function New-TrayIcon([int]$pct, [bool]$unlimited) {
+    $bmp = New-Object System.Drawing.Bitmap(16,16)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.Clear([System.Drawing.Color]::Transparent)
+
+    if ($pct -ge 90) { $c = [System.Drawing.Color]::FromArgb(220,50,50) }
+    elseif ($pct -ge 70) { $c = [System.Drawing.Color]::FromArgb(230,150,40) }
+    else { $c = [System.Drawing.Color]::FromArgb(0,140,220) }
+
+    $g.FillEllipse((New-Object System.Drawing.SolidBrush $c), 1,1,14,14)
+
+    $label = if ($unlimited) { 'U' } elseif ($pct -ge 100) { '!' } else { [string]$pct }
+    $f = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $g.DrawString($label, $f, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0,0,16,16)), $sf)
+    $g.Dispose()
+
+    $ico = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    $bmp.Dispose()
+    return $ico
 }
-$tray.Icon=Icon -p 0; $tray.Visible=$true; $tray.Text='UnoRouter: загрузка...'
-$menu=New-Object System.Windows.Forms.ContextMenuStrip
-$miR=$menu.Items.Add('Обновить'); $miR.Add_Click({Refresh})
-$menu.Items.Add('-')|Out-Null; $miO=$menu.Items.Add('Ключи UnoRouter'); $miO.Add_Click({Start-Process 'https://openrouter.ai/keys'})
-$menu.Items.Add('-')|Out-Null; $miX=$menu.Items.Add('Выход'); $miX.Add_Click({$tray.Visible=$false;[System.Windows.Forms.Application]::Exit()})
-$tray.ContextMenuStrip=$menu
-$cfg=Read-Config
-function Refresh{
-  try{$r=Get-Usage $cfg; $tray.Icon=Icon -p $r.pct; $tray.Text="UnoRouter: {0}% ({1}/{2}) | Осталось {3}" -f $r.pct,$r.used,$r.limit,$r.remaining; if($r.pct -ge 90 -and $script:last -ne 100){$tray.ShowBalloonTip(5000,'UnoRouter: лимит почти исчерпан',("Осталось {0}" -f $r.remaining),[System.Windows.Forms.ToolTipIcon]::Warning)}; if($r.pct -ge 100 -and $script:last -lt 100){$tray.ShowBalloonTip(5000,'UnoRouter: лимит исчерпан','Бесплатные запросы на сегодня закончились',[System.Windows.Forms.ToolTipIcon]::Error)}; $script:last=$r.pct; Add-Content $script:LogFile ("[{0}] {1}% {2}/{3}" -f (Get-Date -f 'yyyy-MM-dd HH:mm:ss'),$r.pct,$r.used,$r.limit)-Encoding UTF8}catch{Add-Content $script:LogFile ("ERROR: "+$_)-Encoding UTF8}\ntry{[IO.File]::WriteAllText($script:LogFile, (Get-Content $script:LogFile -Raw | Select-String -Pattern 'ERROR' -NotMatch | Out-String).Trim(), [Text.Encoding]::UTF8)}catch{}\n}\n$script:last=-1\nRefresh\n$timer=New-Object System.Windows.Forms.Timer; $timer.Interval=$cfg.update_interval*1000; $timer.Add_Tick({Refresh}); $timer.Start()\n[System.Windows.Forms.Application]::Run(); $tray.Visible=$false; $tray.Dispose()\n
+
+# один экземпляр
+$created = $false
+$mutex = New-Object System.Threading.Mutex($true, $MutexName, [ref]$created)
+if (-not $created) { return }
+
+$cfg = $null
+$cfgError = $null
+try { $cfg = Read-Config } catch { $cfgError = $_.Exception.Message }
+
+$tray = New-Object System.Windows.Forms.NotifyIcon
+$tray.Icon = New-TrayIcon 0 $false
+$tray.Text = 'UnoRouter: загрузка...'
+$tray.Visible = $true
+
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+$miRefresh = $menu.Items.Add('Обновить сейчас')
+$miRefresh.Add_Click({ Refresh-Usage })
+$menu.Items.Add('-') | Out-Null
+$miLogin = $menu.Items.Add('Открыть кабинет UnoRouter')
+$miLogin.Add_Click({ Start-Process 'https://unorouter.com/en/token' })
+$menu.Items.Add('-') | Out-Null
+$miExit = $menu.Items.Add('Выход')
+$miExit.Add_Click({ $tray.Visible = $false; [System.Windows.Forms.Application]::Exit() })
+$tray.ContextMenuStrip = $menu
+
+$script:lastPct = -1
+
+function Refresh-Usage {
+    if (-not $script:cfg) {
+        $tray.Text = ('UnoRouter: ' + ($script:cfgError -replace '\s+',' ')).Substring(0, [Math]::Min(63, ('UnoRouter: ' + $script:cfgError).Length))
+        return
+    }
+    try {
+        $u = Get-Usage $script:cfg
+        $tray.Icon = New-TrayIcon $u.pct $u.unlimited
+        $lim = if ($u.unlimited) { 'без лимита' } else { ('{0:N2} USD' -f $u.limit) }
+        $tray.Text = ('UnoRouter: сегодня {0:N2}$ · месяц {1:N2}$ · {2}' -f $u.todayUsd, $u.monthUsd, $lim)
+        if ($tray.Text.Length -gt 63) { $tray.Text = $tray.Text.Substring(0,60) + '...' }
+
+        if (-not $u.unlimited -and $u.pct -ge 90 -and $script:lastPct -lt 90) {
+            $tray.ShowBalloonTip(6000, 'UnoRouter: израсходовано 90% лимита',
+                ('Месяц: {0:N2} из {1:N2} USD' -f $u.monthUsd, $u.limit),
+                [System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+        if (-not $u.unlimited -and $u.pct -lt 90) { }
+        $script:lastPct = $u.pct
+        Log-Str ('today={0:N2} month={1:N2} limit={2} pct={3}%' -f $u.todayUsd, $u.monthUsd, $lim, $u.pct)
+    } catch {
+        $tray.Text = 'UnoRouter: ошибка запроса'
+        Log-Str ('ERROR: ' + $_.Exception.Message)
+    }
+}
+
+$script:cfg = $cfg
+$script:cfgError = $cfgError
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = if ($cfg) { $cfg.update_interval * 1000 } else { 300000 }
+$timer.Add_Tick({ Refresh-Usage })
+$timer.Start()
+
+Refresh-Usage
+[System.Windows.Forms.Application]::Run()
+
+$tray.Visible = $false
+$tray.Dispose()
